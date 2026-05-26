@@ -50,27 +50,57 @@ CTI_OFFICES = [
 
 STATUSES = ['New Hire', 'Repeater', 'Re Hire', 'Resigned']
 
-# ── Core functions ────────────────────────────────────────────────────────────
-def build_lookup_dict(zoho_bytes, inactive_bytes):
-    lookup = {}
-    for label, data in [('inactive', inactive_bytes), ('zoho', zoho_bytes)]:
-        if not data: continue
-        try:
-            df = pd.read_excel(io.BytesIO(data))
-            e_col   = find_col(df, ['Seafarer ID Number','Seafarer ID','E-Number Code','Crew ID'])
-            cti_col = find_col(df, ['CTI Office'])
-            sta_col = find_col(df, ['Employment Status'])
-            if not e_col: continue
-            for _, row in df.dropna(subset=[e_col]).iterrows():
-                e = clean_id(row[e_col])
-                if e:
-                    lookup[e] = {
-                        'cti':    clean_cell(row[cti_col]) if cti_col else '',
-                        'status': clean_cell(row[sta_col]) if sta_col else '',
-                    }
-        except: pass
-    return lookup
+# ── Read Zoho export (zip or xlsx/csv) ───────────────────────────────────────
+def read_zoho_export(file_bytes, filename):
+    """Accepts .zip (Zoho export), .xlsx, or .csv"""
+    dfs = []
 
+    if filename.endswith('.zip'):
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+            for name in z.namelist():
+                if name.endswith('.csv'):
+                    with z.open(name) as f:
+                        try:
+                            df = pd.read_csv(f)
+                            dfs.append(df)
+                        except: pass
+                elif name.endswith('.xlsx'):
+                    with z.open(name) as f:
+                        try:
+                            df = pd.read_excel(f)
+                            dfs.append(df)
+                        except: pass
+    elif filename.endswith('.csv'):
+        dfs.append(pd.read_csv(io.BytesIO(file_bytes)))
+    else:
+        dfs.append(pd.read_excel(io.BytesIO(file_bytes)))
+
+    if not dfs:
+        return None, "No readable files found in the upload."
+
+    combined = pd.concat(dfs, ignore_index=True)
+    return combined, f"{len(combined):,} records loaded from {len(dfs)} file(s)"
+
+# ── Build lookup dict ─────────────────────────────────────────────────────────
+def build_lookup_dict(df):
+    lookup = {}
+    e_col   = find_col(df, ['Seafarer ID Number','Seafarer ID','E-Number Code','Crew ID'])
+    cti_col = find_col(df, ['CTI Office'])
+    sta_col = find_col(df, ['Employment Status'])
+
+    if not e_col:
+        return {}, "No E-Number column found in master file."
+
+    for _, row in df.dropna(subset=[e_col]).iterrows():
+        e = clean_id(row[e_col])
+        if e:
+            lookup[e] = {
+                'cti':    clean_cell(row[cti_col]) if cti_col else '',
+                'status': clean_cell(row[sta_col]) if sta_col else '',
+            }
+    return lookup, f"{len(lookup):,} seafarers indexed"
+
+# ── Fill joiner report ────────────────────────────────────────────────────────
 def run_joiner_fill(joiner_bytes, lookup_dict, manual_overrides):
     wb = load_workbook(io.BytesIO(joiner_bytes))
     log_lines = []
@@ -146,10 +176,11 @@ def run_joiner_fill(joiner_bytes, lookup_dict, manual_overrides):
     wb.save(out)
     return out.getvalue(), '\n'.join(log_lines), total_missing
 
+# ── Split by office ───────────────────────────────────────────────────────────
 def run_split(filled_bytes):
-    xls  = pd.ExcelFile(io.BytesIO(filled_bytes))
+    xls   = pd.ExcelFile(io.BytesIO(filled_bytes))
     books = {}
-    tag  = datetime.now().strftime('%Y%m%d')
+    tag   = datetime.now().strftime('%Y%m%d')
 
     for sheet in xls.sheet_names:
         df = pd.read_excel(xls, sheet_name=sheet)
@@ -178,19 +209,22 @@ st.caption('Fill CTI Office & Employment Status · Split by office · CTI Indone
 
 # Step 1
 st.header('Step 1 — Upload Files')
-c1, c2, c3 = st.columns(3)
+c1, c2 = st.columns(2)
 with c1:
-    joiner_file   = st.file_uploader('Joiner Report', type=['xlsx','xls'], key='joiner')
+    joiner_file = st.file_uploader(
+        'Joiner Report (.xlsx)',
+        type=['xlsx','xls'], key='joiner')
 with c2:
-    zoho_file     = st.file_uploader('Zoho Master', type=['xlsx','xls'], key='zoho')
-with c3:
-    inactive_file = st.file_uploader('Inactive Master (optional)', type=['xlsx','xls'], key='inactive')
+    zoho_file = st.file_uploader(
+        'Zoho Export — drag the ZIP straight from Zoho Recruit',
+        type=['zip','xlsx','xls','csv'], key='zoho',
+        help='Export from Zoho Recruit → Data Administration → Export → Download ZIP and upload here')
 
 st.divider()
 
 # Step 2
 st.header('Step 2 — Manual Overrides')
-st.caption('For E-Numbers not found in the master — fill them in here before running.')
+st.caption('Run first to see missing E-Numbers, then add them here and re-run.')
 
 if 'overrides' not in st.session_state:
     st.session_state['overrides'] = [{'e': '', 'cti': CTI_OFFICES[0], 'status': STATUSES[0]}]
@@ -225,39 +259,47 @@ st.header('Step 3 — Run')
 
 if joiner_file and zoho_file:
     if st.button('▶ Fill + Split by Office', type='primary', use_container_width=True):
-        joiner_bytes   = joiner_file.read()
-        zoho_bytes     = zoho_file.read()
-        inactive_bytes = inactive_file.read() if inactive_file else None
+        joiner_bytes = joiner_file.read()
+        zoho_bytes   = zoho_file.read()
 
-        with st.spinner('Building lookup...'):
-            lookup = build_lookup_dict(zoho_bytes, inactive_bytes)
-        st.write(f'Lookup ready: **{len(lookup):,}** seafarers in master')
+        with st.spinner('Reading Zoho master...'):
+            zoho_df, zoho_msg = read_zoho_export(zoho_bytes, zoho_file.name)
 
-        manual = {
-            ov['e'].strip(): {'cti': ov['cti'], 'status': ov['status']}
-            for ov in st.session_state['overrides'] if ov['e'].strip()
-        }
-        if manual:
-            st.write(f'Manual overrides: **{len(manual)}** entries')
+        if zoho_df is None:
+            st.error(zoho_msg)
+        else:
+            st.write(f'✓ Zoho master: **{zoho_msg}**')
 
-        with st.spinner('Filling joiner report...'):
-            filled_bytes, fill_log, missing = run_joiner_fill(joiner_bytes, lookup, manual)
+            with st.spinner('Building lookup...'):
+                lookup, lookup_msg = build_lookup_dict(zoho_df)
+            st.write(f'✓ Lookup: **{lookup_msg}**')
 
-        with st.spinner('Splitting by office...'):
-            split_bytes, offices = run_split(filled_bytes)
+            manual = {
+                ov['e'].strip(): {'cti': ov['cti'], 'status': ov['status']}
+                for ov in st.session_state['overrides'] if ov['e'].strip()
+            }
+            if manual:
+                st.write(f'✓ Manual overrides: **{len(manual)}** entries')
 
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        st.session_state.update({
-            'j_filled':      filled_bytes,
-            'j_filled_name': f'Joiner_Filled_{ts}.xlsx',
-            'j_split':       split_bytes,
-            'j_split_name':  f'CTI_By_Office_{ts}.zip',
-            'j_log':         fill_log,
-            'j_missing':     missing,
-            'j_offices':     offices,
-        })
+            with st.spinner('Filling joiner report...'):
+                filled_bytes, fill_log, missing = run_joiner_fill(
+                    joiner_bytes, lookup, manual)
+
+            with st.spinner('Splitting by office...'):
+                split_bytes, offices = run_split(filled_bytes)
+
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            st.session_state.update({
+                'j_filled':      filled_bytes,
+                'j_filled_name': f'Joiner_Filled_{ts}.xlsx',
+                'j_split':       split_bytes,
+                'j_split_name':  f'CTI_By_Office_{ts}.zip',
+                'j_log':         fill_log,
+                'j_missing':     missing,
+                'j_offices':     offices,
+            })
 else:
-    st.info('Upload the Joiner Report and Zoho Master to continue.')
+    st.info('Upload both the Joiner Report and Zoho Export to continue.')
 
 # Results
 if 'j_filled' in st.session_state:
@@ -282,12 +324,17 @@ if 'j_filled' in st.session_state:
             use_container_width=True, key='dl_split')
 
     if st.session_state.get('j_offices'):
-        st.info('Offices generated: ' + ' · '.join(st.session_state['j_offices']))
+        st.info('Offices: ' + ' · '.join(st.session_state['j_offices']))
 
     if st.session_state.get('j_missing'):
         missing = st.session_state['j_missing']
-        st.warning(f'⚠ {len(missing)} rows not found in master. Add their E-Numbers in Step 2 and re-run.')
-        st.dataframe(pd.DataFrame(missing), use_container_width=True, hide_index=True)
+        st.warning(f'⚠ {len(missing)} rows not found in master — add their E-Numbers in Step 2 above and re-run.')
+        miss_df = pd.DataFrame(missing)
+        st.dataframe(miss_df, use_container_width=True, hide_index=True)
+
+        # Quick copy button for missing E-numbers
+        e_list = ', '.join([m['E-Number'] for m in missing])
+        st.caption(f'Missing E-Numbers: `{e_list}`')
 
 st.divider()
 st.caption('CTI Indonesia · Bali · Internal Use Only')
